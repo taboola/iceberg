@@ -31,12 +31,15 @@ import org.apache.iceberg.types.Types.StringType;
 import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.types.Types.VariantType;
 import org.apache.iceberg.variants.Variant;
+import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 import org.apache.parquet.schema.Type;
 import org.apache.parquet.schema.Types;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class TestPruneColumns {
   @Test
@@ -451,74 +454,72 @@ public class TestPruneColumns {
     assertPrunesTo(fileSchema, fileSchema.select("l.element.points.element.x"));
   }
 
-  @Test
-  void twoLevelListOfStructsInStruct() {
+  @ParameterizedTest
+  @ValueSource(strings = {"array", "l_tuple"})
+  void twoLevelListOfStructsInStruct(String repeatedName) {
     MessageType fileSchema =
         Types.buildMessage()
             .addField(
                 Types.buildGroup(Type.Repetition.OPTIONAL)
-                    .addField(
-                        Types.buildGroup(Type.Repetition.OPTIONAL)
-                            .addField(
-                                Types.buildGroup(Type.Repetition.REPEATED)
-                                    .addField(
-                                        Types.primitive(
-                                                PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
-                                            .id(4)
-                                            .named("x"))
-                                    .addField(
-                                        Types.primitive(
-                                                PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
-                                            .id(5)
-                                            .named("y"))
-                                    .id(3)
-                                    .named("array"))
-                            .as(LogicalTypeAnnotation.listType())
-                            .id(2)
-                            .named("l"))
-                    .addField(
-                        Types.primitive(PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
-                            .id(6)
-                            .named("z"))
+                    .addField(twoLevelList(repeatedName, optionalInt(4, "x"), optionalInt(5, "y")))
+                    .addField(optionalInt(6, "z"))
+                    .id(1)
+                    .named("s"))
+            .named("table");
+
+    MessageType expected =
+        Types.buildMessage()
+            .addField(
+                Types.buildGroup(Type.Repetition.OPTIONAL)
+                    .addField(twoLevelList(repeatedName, optionalInt(4, "x")))
                     .id(1)
                     .named("s"))
             .named("table");
 
     Schema projection =
         new Schema(
-            NestedField.optional(
-                1,
-                "s",
-                StructType.of(
-                    NestedField.optional(
-                        2,
-                        "l",
-                        ListType.ofRequired(
-                            3, StructType.of(NestedField.optional(4, "x", IntegerType.get())))))));
+            NestedField.optional(1, "s", StructType.of(NestedField.optional(2, "l", listOfX()))));
 
-    MessageType expected =
+    assertThat(ParquetSchemaUtil.pruneColumns(fileSchema, projection)).isEqualTo(expected);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"bag", "element"})
+  void twoLevelListInStructIsKeptWhenPruningChangesLayout(String repeatedName) {
+    GroupType list = twoLevelList(repeatedName, optionalInt(4, "x"), optionalInt(5, "y"));
+    MessageType fileSchema =
         Types.buildMessage()
             .addField(
                 Types.buildGroup(Type.Repetition.OPTIONAL)
-                    .addField(
-                        Types.buildGroup(Type.Repetition.OPTIONAL)
-                            .addField(
-                                Types.buildGroup(Type.Repetition.REPEATED)
-                                    .addField(
-                                        Types.primitive(
-                                                PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
-                                            .id(4)
-                                            .named("x"))
-                                    .id(3)
-                                    .named("array"))
-                            .as(LogicalTypeAnnotation.listType())
-                            .id(2)
-                            .named("l"))
+                    .addField(list)
+                    .addField(optionalInt(6, "z"))
                     .id(1)
                     .named("s"))
             .named("table");
 
+    MessageType expected =
+        Types.buildMessage()
+            .addField(Types.buildGroup(Type.Repetition.OPTIONAL).addField(list).id(1).named("s"))
+            .named("table");
+
+    Schema projection =
+        new Schema(
+            NestedField.optional(1, "s", StructType.of(NestedField.optional(2, "l", listOfX()))));
+
     assertThat(ParquetSchemaUtil.pruneColumns(fileSchema, projection)).isEqualTo(expected);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"bag", "element"})
+  void twoLevelListIsKeptWhenPruningChangesLayout(String repeatedName) {
+    GroupType list = twoLevelList(repeatedName, optionalInt(4, "x"), optionalInt(5, "y"));
+    MessageType fileSchema =
+        Types.buildMessage().addField(list).addField(optionalInt(6, "z")).named("table");
+
+    Schema projection = new Schema(NestedField.optional(2, "l", listOfX()));
+
+    assertThat(ParquetSchemaUtil.pruneColumns(fileSchema, projection))
+        .isEqualTo(Types.buildMessage().addField(list).named("table"));
   }
 
   @Test
@@ -665,6 +666,26 @@ public class TestPruneColumns {
 
     assertThat(ParquetSchemaUtil.pruneColumns(fileSchema, projection))
         .isEqualTo(ParquetSchemaUtil.convert(projection, "table"));
+  }
+
+  private static GroupType twoLevelList(String repeatedName, Type... elementFields) {
+    return Types.buildGroup(Type.Repetition.OPTIONAL)
+        .addField(
+            Types.buildGroup(Type.Repetition.REPEATED)
+                .addFields(elementFields)
+                .id(3)
+                .named(repeatedName))
+        .as(LogicalTypeAnnotation.listType())
+        .id(2)
+        .named("l");
+  }
+
+  private static ListType listOfX() {
+    return ListType.ofRequired(3, StructType.of(NestedField.optional(4, "x", IntegerType.get())));
+  }
+
+  private static Type optionalInt(int id, String name) {
+    return Types.primitive(PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL).id(id).named(name);
   }
 
   private static StructType pointType(int xId, int yId) {

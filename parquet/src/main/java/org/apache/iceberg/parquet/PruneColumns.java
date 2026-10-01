@@ -124,11 +124,17 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
 
     if (element != null && !Objects.equal(element, originalElement)) {
       validatePrunedField(element, originalElement);
-      if (originalElement.isRepetition(Type.Repetition.REPEATED)) {
-        return list.withNewFields(element);
-      } else {
-        return list.withNewFields(repeated.asGroupType().withNewFields(element));
+      GroupType prunedList =
+          originalElement.isRepetition(Type.Repetition.REPEATED)
+              ? list.withNewFields(element)
+              : list.withNewFields(repeated.asGroupType().withNewFields(element));
+
+      // pruning a 2-level list's repeated group to one field can make it read as a 3-level list
+      if (ParquetSchemaUtil.determineListElementType(prunedList).equals(element)) {
+        return prunedList;
       }
+
+      return list;
     } else if (elementId != null && selectedIds.contains(elementId)) {
       return list;
     } else if (element != null) {
