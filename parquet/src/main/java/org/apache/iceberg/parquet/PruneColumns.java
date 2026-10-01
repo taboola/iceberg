@@ -58,7 +58,7 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
           hasChange = true;
           builder.addField(field);
         } else {
-          if (isStruct(originalField, expected.field(fieldId))) {
+          if (isStruct(originalField, expected != null ? expected.field(fieldId) : null)) {
             hasChange = true;
             builder.addField(originalField.asGroupType().withNewFields(Collections.emptyList()));
           } else {
@@ -91,9 +91,16 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
       Type field = fields.get(i);
       Integer fieldId = getId(originalField);
       if (fieldId != null && selectedIds.contains(fieldId)) {
-        filteredFields.add(originalField);
+        if (field != null && !Objects.equal(field, originalField)) {
+          validatePrunedField(field, originalField);
+          filteredFields.add(field);
+          hasChange = true;
+        } else {
+          filteredFields.add(originalField);
+        }
       } else if (field != null) {
-        filteredFields.add(originalField);
+        validatePrunedField(field, originalField);
+        filteredFields.add(field);
         hasChange = true;
       }
     }
@@ -115,16 +122,16 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
     Type originalElement = ParquetSchemaUtil.determineListElementType(list);
     Integer elementId = getId(originalElement);
 
-    if (elementId != null && selectedIds.contains(elementId)) {
+    if (element != null && !Objects.equal(element, originalElement)) {
+      validatePrunedField(element, originalElement);
+      if (originalElement.isRepetition(Type.Repetition.REPEATED)) {
+        return list.withNewFields(element);
+      } else {
+        return list.withNewFields(repeated.asGroupType().withNewFields(element));
+      }
+    } else if (elementId != null && selectedIds.contains(elementId)) {
       return list;
     } else if (element != null) {
-      if (!Objects.equal(element, originalElement)) {
-        if (originalElement.isRepetition(Type.Repetition.REPEATED)) {
-          return list.withNewFields(element);
-        } else {
-          return list.withNewFields(repeated.asGroupType().withNewFields(element));
-        }
-      }
       return list;
     }
 
@@ -140,13 +147,13 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
     Integer keyId = getId(originalKey);
     Integer valueId = getId(originalValue);
 
-    if ((keyId != null && selectedIds.contains(keyId))
+    if (value != null && !Objects.equal(value, originalValue)) {
+      validatePrunedField(value, originalValue);
+      return map.withNewFields(repeated.withNewFields(originalKey, value));
+    } else if ((keyId != null && selectedIds.contains(keyId))
         || (valueId != null && selectedIds.contains(valueId))) {
       return map;
     } else if (value != null) {
-      if (!Objects.equal(value, originalValue)) {
-        return map.withNewFields(repeated.withNewFields(originalKey, value));
-      }
       return map;
     }
 
@@ -170,13 +177,34 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
   }
 
   private boolean isStruct(Type field, NestedField expected) {
-    if (field.isPrimitive() || expected.type().isVariantType()) {
+    if (field.isPrimitive()) {
       return false;
     } else {
       GroupType groupType = field.asGroupType();
       LogicalTypeAnnotation logicalTypeAnnotation = groupType.getLogicalTypeAnnotation();
       return !LogicalTypeAnnotation.mapType().equals(logicalTypeAnnotation)
-          && !LogicalTypeAnnotation.listType().equals(logicalTypeAnnotation);
+          && !LogicalTypeAnnotation.listType().equals(logicalTypeAnnotation)
+          && (expected == null || expected.type().isStructType());
     }
+  }
+
+  private void validatePrunedField(Type prunedField, Type originalField) {
+    Preconditions.checkState(
+        prunedField.getName().equals(originalField.getName()),
+        "Pruned field must have same name as original: '%s' vs '%s'",
+        prunedField.getName(),
+        originalField.getName());
+
+    Preconditions.checkState(
+        Objects.equal(getId(prunedField), getId(originalField)),
+        "Pruned field must have same ID as original: %s vs %s",
+        getId(prunedField),
+        getId(originalField));
+
+    Preconditions.checkState(
+        prunedField.getRepetition() == originalField.getRepetition(),
+        "Pruned field must have same repetition as original: %s vs %s",
+        prunedField.getRepetition(),
+        originalField.getRepetition());
   }
 }

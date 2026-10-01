@@ -305,6 +305,381 @@ public class TestPruneColumns {
     assertThat(actual).as("Pruned schema should be matched").isEqualTo(expected);
   }
 
+  @Test
+  void nestedStructInStruct() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(
+                        2,
+                        "inner",
+                        StructType.of(
+                            NestedField.optional(
+                                3,
+                                "deepest",
+                                StructType.of(
+                                    NestedField.optional(4, "x", IntegerType.get()),
+                                    NestedField.optional(5, "y", IntegerType.get()))),
+                            NestedField.optional(6, "z", IntegerType.get()))),
+                    NestedField.optional(7, "w", IntegerType.get()))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("s.inner.deepest.x"));
+  }
+
+  @Test
+  void listOfStructsInStruct() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(2, "l", ListType.ofOptional(3, pointType(4, 5))),
+                    NestedField.optional(6, "z", IntegerType.get()))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("s.l.element.x"));
+  }
+
+  @Test
+  void mapOfStructsInStruct() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(
+                        2, "m", MapType.ofOptional(3, 4, StringType.get(), pointType(5, 6))),
+                    NestedField.optional(7, "z", IntegerType.get()))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("s.m.value.x"));
+  }
+
+  @Test
+  void nestedStructInListElement() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "l",
+                ListType.ofOptional(
+                    2,
+                    StructType.of(
+                        NestedField.optional(3, "inner", pointType(4, 5)),
+                        NestedField.optional(6, "z", IntegerType.get())))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("l.element.inner.x"));
+  }
+
+  @Test
+  void nestedStructInMapValue() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "m",
+                MapType.ofOptional(
+                    2,
+                    3,
+                    StringType.get(),
+                    StructType.of(
+                        NestedField.optional(4, "inner", pointType(5, 6)),
+                        NestedField.optional(7, "z", IntegerType.get())))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("m.value.inner.x"));
+  }
+
+  @Test
+  void listOfListsOfStructs() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1, "ll", ListType.ofOptional(2, ListType.ofOptional(3, pointType(4, 5)))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("ll.element.element.x"));
+  }
+
+  @Test
+  void listOfListsOfStructsInStruct() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(
+                        2, "ll", ListType.ofOptional(3, ListType.ofOptional(4, pointType(5, 6)))),
+                    NestedField.optional(7, "z", IntegerType.get()))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("s.ll.element.element.x"));
+  }
+
+  @Test
+  void nestedStructInListOfLists() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "ll",
+                ListType.ofOptional(
+                    2,
+                    ListType.ofOptional(
+                        3,
+                        StructType.of(
+                            NestedField.optional(4, "inner", pointType(5, 6)),
+                            NestedField.optional(7, "z", IntegerType.get()))))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("ll.element.element.inner.x"));
+  }
+
+  @Test
+  void listOfStructsInListOfStructs() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "l",
+                ListType.ofOptional(
+                    2,
+                    StructType.of(
+                        NestedField.optional(3, "points", ListType.ofOptional(4, pointType(5, 6))),
+                        NestedField.optional(7, "z", IntegerType.get())))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("l.element.points.element.x"));
+  }
+
+  @Test
+  void twoLevelListOfStructsInStruct() {
+    MessageType fileSchema =
+        Types.buildMessage()
+            .addField(
+                Types.buildGroup(Type.Repetition.OPTIONAL)
+                    .addField(
+                        Types.buildGroup(Type.Repetition.OPTIONAL)
+                            .addField(
+                                Types.buildGroup(Type.Repetition.REPEATED)
+                                    .addField(
+                                        Types.primitive(
+                                                PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
+                                            .id(4)
+                                            .named("x"))
+                                    .addField(
+                                        Types.primitive(
+                                                PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
+                                            .id(5)
+                                            .named("y"))
+                                    .id(3)
+                                    .named("array"))
+                            .as(LogicalTypeAnnotation.listType())
+                            .id(2)
+                            .named("l"))
+                    .addField(
+                        Types.primitive(PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
+                            .id(6)
+                            .named("z"))
+                    .id(1)
+                    .named("s"))
+            .named("table");
+
+    Schema projection =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(
+                        2,
+                        "l",
+                        ListType.ofRequired(
+                            3, StructType.of(NestedField.optional(4, "x", IntegerType.get())))))));
+
+    MessageType expected =
+        Types.buildMessage()
+            .addField(
+                Types.buildGroup(Type.Repetition.OPTIONAL)
+                    .addField(
+                        Types.buildGroup(Type.Repetition.OPTIONAL)
+                            .addField(
+                                Types.buildGroup(Type.Repetition.REPEATED)
+                                    .addField(
+                                        Types.primitive(
+                                                PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
+                                            .id(4)
+                                            .named("x"))
+                                    .id(3)
+                                    .named("array"))
+                            .as(LogicalTypeAnnotation.listType())
+                            .id(2)
+                            .named("l"))
+                    .id(1)
+                    .named("s"))
+            .named("table");
+
+    assertThat(ParquetSchemaUtil.pruneColumns(fileSchema, projection)).isEqualTo(expected);
+  }
+
+  @Test
+  void fieldsAtDifferentDepths() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.required(1, "id", IntegerType.get()),
+            NestedField.optional(
+                2,
+                "s",
+                StructType.of(
+                    NestedField.optional(3, "inner", pointType(4, 5)),
+                    NestedField.optional(6, "l", ListType.ofOptional(7, pointType(8, 9))),
+                    NestedField.optional(
+                        10, "m", MapType.ofOptional(11, 12, StringType.get(), pointType(13, 14))),
+                    NestedField.optional(15, "z", IntegerType.get()))));
+
+    assertPrunesTo(
+        fileSchema, fileSchema.select("id", "s.inner.y", "s.l.element.x", "s.m.value.y", "s.z"));
+  }
+
+  @Test
+  void fullNestedProjectionIsUnchanged() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(2, "inner", pointType(3, 4)),
+                    NestedField.optional(
+                        5, "ll", ListType.ofOptional(6, ListType.ofOptional(7, pointType(8, 9)))),
+                    NestedField.optional(
+                        10,
+                        "m",
+                        MapType.ofOptional(
+                            11,
+                            12,
+                            StringType.get(),
+                            ListType.ofOptional(13, pointType(14, 15)))))));
+
+    assertPrunesTo(fileSchema, fileSchema);
+  }
+
+  @Test
+  void variantInNestedStruct() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(
+                        2,
+                        "inner",
+                        StructType.of(
+                            NestedField.optional(3, "v", VariantType.get()),
+                            NestedField.optional(4, "x", IntegerType.get()))),
+                    NestedField.optional(5, "z", IntegerType.get()))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("s.inner.v"));
+  }
+
+  @Test
+  void mapWithStructKeyInStruct() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(
+                        2, "m", MapType.ofOptional(3, 4, pointType(5, 6), pointType(7, 8))),
+                    NestedField.optional(9, "z", IntegerType.get()))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("s.m.value.x"));
+  }
+
+  @Test
+  void projectionWithNestedFieldMissingFromFile() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(2, "inner", pointType(3, 4)),
+                    NestedField.optional(5, "z", IntegerType.get()))));
+
+    Schema projection =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(
+                        2,
+                        "inner",
+                        StructType.of(
+                            NestedField.optional(3, "x", IntegerType.get()),
+                            NestedField.optional(6, "added", IntegerType.get()))))));
+
+    MessageType pruned =
+        ParquetSchemaUtil.pruneColumns(ParquetSchemaUtil.convert(fileSchema, "table"), projection);
+
+    assertThat(pruned)
+        .isEqualTo(ParquetSchemaUtil.convert(fileSchema.select("s.inner.x"), "table"));
+  }
+
+  @Test
+  void nestedFieldsWithoutIds() {
+    MessageType fileSchema =
+        Types.buildMessage()
+            .addField(
+                Types.buildGroup(Type.Repetition.OPTIONAL)
+                    .addField(
+                        Types.buildGroup(Type.Repetition.OPTIONAL)
+                            .addField(
+                                Types.primitive(PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
+                                    .id(3)
+                                    .named("x"))
+                            .addField(
+                                Types.primitive(PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
+                                    .named("y"))
+                            .id(2)
+                            .named("inner"))
+                    .addField(
+                        Types.primitive(PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
+                            .named("z"))
+                    .id(1)
+                    .named("s"))
+            .named("table");
+
+    Schema projection =
+        new Schema(
+            NestedField.optional(
+                1,
+                "s",
+                StructType.of(
+                    NestedField.optional(
+                        2,
+                        "inner",
+                        StructType.of(NestedField.optional(3, "x", IntegerType.get()))))));
+
+    assertThat(ParquetSchemaUtil.pruneColumns(fileSchema, projection))
+        .isEqualTo(ParquetSchemaUtil.convert(projection, "table"));
+  }
+
+  private static StructType pointType(int xId, int yId) {
+    return StructType.of(
+        NestedField.optional(xId, "x", IntegerType.get()),
+        NestedField.optional(yId, "y", IntegerType.get()));
+  }
+
+  private static void assertPrunesTo(Schema fileSchema, Schema projection) {
+    MessageType pruned =
+        ParquetSchemaUtil.pruneColumns(ParquetSchemaUtil.convert(fileSchema, "table"), projection);
+
+    assertThat(pruned).isEqualTo(ParquetSchemaUtil.convert(projection, "table"));
+  }
+
   private static Type buildVariantType(int id, String name) {
     return Types.buildGroup(Type.Repetition.OPTIONAL)
         .as(LogicalTypeAnnotation.variantType(Variant.VARIANT_SPEC_VERSION))

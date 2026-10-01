@@ -18,6 +18,9 @@
  */
 package org.apache.iceberg.parquet;
 
+import static org.apache.iceberg.types.Types.NestedField.optional;
+import static org.apache.iceberg.types.Types.NestedField.required;
+
 import java.io.IOException;
 import java.util.List;
 import org.apache.iceberg.InternalTestHelpers;
@@ -34,6 +37,13 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DataWriter;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.types.Types.IntegerType;
+import org.apache.iceberg.types.Types.ListType;
+import org.apache.iceberg.types.Types.LongType;
+import org.apache.iceberg.types.Types.MapType;
+import org.apache.iceberg.types.Types.StringType;
+import org.apache.iceberg.types.Types.StructType;
+import org.junit.jupiter.api.Test;
 
 public class TestInternalParquet extends DataTestBase {
   @Override
@@ -71,6 +81,50 @@ public class TestInternalParquet extends DataTestBase {
   @Override
   protected void writeAndValidate(Schema schema, List<Record> expected) throws IOException {
     writeAndValidate(schema, schema, expected);
+  }
+
+  @Test
+  void nestedProjectionInListsAndMaps() throws IOException {
+    Schema writeSchema =
+        new Schema(
+            required(1, "id", LongType.get()),
+            optional(
+                2,
+                "s",
+                StructType.of(
+                    optional(3, "inner", pointType(4, 5)),
+                    optional(6, "points", ListType.ofOptional(7, pointType(8, 9))),
+                    optional(
+                        10,
+                        "tags",
+                        MapType.ofOptional(11, 12, StringType.get(), pointType(13, 14))),
+                    optional(15, "z", StringType.get()))),
+            optional(
+                16,
+                "matrix",
+                ListType.ofOptional(
+                    17,
+                    ListType.ofOptional(
+                        18,
+                        StructType.of(
+                            optional(19, "inner", pointType(20, 21)),
+                            optional(22, "points", ListType.ofOptional(23, pointType(24, 25))),
+                            optional(26, "z", StringType.get()))))));
+
+    Schema projection =
+        writeSchema.select(
+            "id",
+            "s.inner.x",
+            "s.points.element.y",
+            "s.tags.value.x",
+            "matrix.element.element.inner.y",
+            "matrix.element.element.points.element.x");
+
+    writeAndValidate(writeSchema, projection);
+  }
+
+  private static StructType pointType(int xId, int yId) {
+    return StructType.of(optional(xId, "x", IntegerType.get()), optional(yId, "y", LongType.get()));
   }
 
   protected void writeAndValidate(Schema writeSchema, Schema expectedSchema, List<Record> expected)
