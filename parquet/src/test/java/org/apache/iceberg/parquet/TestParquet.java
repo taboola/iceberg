@@ -38,6 +38,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Stream;
 import org.apache.avro.generic.GenericData;
@@ -60,8 +61,10 @@ import org.apache.iceberg.types.Types.IntegerType;
 import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.variants.Variant;
 import org.apache.parquet.avro.AvroParquetWriter;
+import org.apache.parquet.column.statistics.SizeStatistics;
 import org.apache.parquet.column.statistics.Statistics;
 import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.ParquetOutputFormat;
 import org.apache.parquet.hadoop.ParquetWriter;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
@@ -336,6 +339,65 @@ public class TestParquet {
     assertThatThrownBy(() -> ParquetAvroWriter.buildWriter(schema))
         .isInstanceOf(UnsupportedOperationException.class)
         .hasMessage("Avro writer does not support variant types");
+  }
+
+  @Test
+  void sizeStatisticsDisabled() throws IOException {
+    List<ColumnChunkMetaData> columns =
+        writeAndReadColumnChunks(
+            ImmutableMap.of(ParquetOutputFormat.SIZE_STATISTICS_ENABLED, "false"),
+            ParquetAvroWriter::buildWriter);
+
+    assertThat(columns).isNotEmpty().noneMatch(TestParquet::hasSizeStatistics);
+    assertThat(columns).noneMatch(column -> column.getStatistics().isEmpty());
+  }
+
+  @Test
+  void sizeStatisticsDisabledWithWriteSupport() throws IOException {
+    List<ColumnChunkMetaData> columns =
+        writeAndReadColumnChunks(
+            ImmutableMap.of(ParquetOutputFormat.SIZE_STATISTICS_ENABLED, "false"), null);
+
+    assertThat(columns).isNotEmpty().noneMatch(TestParquet::hasSizeStatistics);
+    assertThat(columns).noneMatch(column -> column.getStatistics().isEmpty());
+  }
+
+  @Test
+  void sizeStatisticsEnabledByDefault() throws IOException {
+    List<ColumnChunkMetaData> columns =
+        writeAndReadColumnChunks(ImmutableMap.of(), ParquetAvroWriter::buildWriter);
+
+    assertThat(columns).isNotEmpty().allMatch(TestParquet::hasSizeStatistics);
+  }
+
+  private List<ColumnChunkMetaData> writeAndReadColumnChunks(
+      Map<String, String> properties, Function<MessageType, ParquetValueWriter<?>> createWriterFunc)
+      throws IOException {
+    Schema schema = new Schema(optional(1, "intCol", IntegerType.get()));
+    org.apache.avro.Schema avroSchema = AvroSchemaUtil.convert(schema.asStruct());
+    List<GenericData.Record> records = Lists.newArrayList();
+    for (int i = 1; i <= 5; i++) {
+      GenericData.Record record = new GenericData.Record(avroSchema);
+      record.put("intCol", i);
+      records.add(record);
+    }
+
+    File file = createTempFile(temp);
+    write(file, schema, properties, createWriterFunc, records.toArray(new GenericData.Record[] {}));
+
+    try (ParquetFileReader reader = ParquetFileReader.open(ParquetIO.file(localInput(file)))) {
+      List<ColumnChunkMetaData> columns = Lists.newArrayList();
+      for (BlockMetaData block : reader.getFooter().getBlocks()) {
+        columns.addAll(block.getColumns());
+      }
+
+      return columns;
+    }
+  }
+
+  private static boolean hasSizeStatistics(ColumnChunkMetaData column) {
+    SizeStatistics sizeStatistics = column.getSizeStatistics();
+    return sizeStatistics != null && sizeStatistics.isValid();
   }
 
   private Pair<File, Long> generateFile(
