@@ -420,6 +420,9 @@ public class Parquet {
                       col -> schema.findColumnName(col.getPrimitiveType().getId().intValue()),
                       col -> String.join(".", col.getPath())));
 
+      boolean sizeStatisticsEnabled =
+          PropertyUtil.propertyAsBoolean(config, ParquetOutputFormat.SIZE_STATISTICS_ENABLED, true);
+
       if (createWriterFunc != null) {
         Preconditions.checkArgument(
             writeSupport == null, "Cannot write with both write support and Parquet value writer");
@@ -437,7 +440,8 @@ public class Parquet {
                 .withDictionaryPageSize(dictionaryPageSize)
                 .withMinRowCountForPageSizeCheck(rowGroupCheckMinRecordCount)
                 .withMaxRowCountForPageSizeCheck(rowGroupCheckMaxRecordCount)
-                .withMaxBloomFilterBytes(bloomFilterMaxBytes);
+                .withMaxBloomFilterBytes(bloomFilterMaxBytes)
+                .withSizeStatisticsEnabled(sizeStatisticsEnabled);
 
         setBloomFilterConfig(
             context,
@@ -478,6 +482,7 @@ public class Parquet {
                 .withPageRowCountLimit(pageRowLimit)
                 .withDictionaryEncoding(dictionaryEnabled)
                 .withDictionaryPageSize(dictionaryPageSize)
+                .withSizeStatisticsEnabled(sizeStatisticsEnabled)
                 .withEncryption(fileEncryptionProperties);
 
         setBloomFilterConfig(
