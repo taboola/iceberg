@@ -362,6 +362,36 @@ public class TestPruneColumns {
   }
 
   @Test
+  void listOfStructsInMapValue() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "m",
+                MapType.ofOptional(
+                    2, 3, StringType.get(), ListType.ofOptional(4, pointType(5, 6)))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("m.value.element.x"));
+  }
+
+  @Test
+  void mapOfStructsInListElement() {
+    Schema fileSchema =
+        new Schema(
+            NestedField.optional(
+                1,
+                "l",
+                ListType.ofOptional(
+                    2,
+                    StructType.of(
+                        NestedField.optional(
+                            3, "m", MapType.ofOptional(4, 5, StringType.get(), pointType(6, 7))),
+                        NestedField.optional(8, "z", IntegerType.get())))));
+
+    assertPrunesTo(fileSchema, fileSchema.select("l.element.m.value.x"));
+  }
+
+  @Test
   void nestedStructInListElement() {
     Schema fileSchema =
         new Schema(
