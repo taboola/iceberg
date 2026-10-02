@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.data;
 
+import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -260,5 +261,52 @@ public class TestSparkParquetReader extends AvroDataTestBase {
     assertThatThrownBy(super::testUnknownMapType)
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageStartingWith("Cannot convert value Parquet: unknown");
+  }
+
+  @Test
+  void nestedProjectionInListsAndMaps() throws IOException {
+    Schema writeSchema =
+        new Schema(
+            required(1, "id", Types.LongType.get()),
+            optional(
+                2,
+                "s",
+                Types.StructType.of(
+                    optional(3, "inner", pointType(4, 5)),
+                    optional(6, "points", Types.ListType.ofOptional(7, pointType(8, 9))),
+                    optional(
+                        10,
+                        "tags",
+                        Types.MapType.ofOptional(
+                            11, 12, Types.StringType.get(), pointType(13, 14))),
+                    optional(15, "z", Types.StringType.get()))),
+            optional(
+                16,
+                "matrix",
+                Types.ListType.ofOptional(
+                    17,
+                    Types.ListType.ofOptional(
+                        18,
+                        Types.StructType.of(
+                            optional(19, "inner", pointType(20, 21)),
+                            optional(
+                                22, "points", Types.ListType.ofOptional(23, pointType(24, 25))),
+                            optional(26, "z", Types.StringType.get()))))));
+
+    Schema projection =
+        writeSchema.select(
+            "id",
+            "s.inner.x",
+            "s.points.element.y",
+            "s.tags.value.x",
+            "matrix.element.element.inner.y",
+            "matrix.element.element.points.element.x");
+
+    writeAndValidate(writeSchema, projection);
+  }
+
+  private static Types.StructType pointType(int xId, int yId) {
+    return Types.StructType.of(
+        optional(xId, "x", Types.IntegerType.get()), optional(yId, "y", Types.LongType.get()));
   }
 }

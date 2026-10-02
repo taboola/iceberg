@@ -58,7 +58,7 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
           hasChange = true;
           builder.addField(field);
         } else {
-          if (isStruct(originalField, expected.field(fieldId))) {
+          if (isStruct(originalField, expected != null ? expected.field(fieldId) : null)) {
             hasChange = true;
             builder.addField(originalField.asGroupType().withNewFields(Collections.emptyList()));
           } else {
@@ -91,9 +91,15 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
       Type field = fields.get(i);
       Integer fieldId = getId(originalField);
       if (fieldId != null && selectedIds.contains(fieldId)) {
-        filteredFields.add(originalField);
+        // selected IDs include struct IDs, so a selected struct may still have pruned children
+        if (field != null && !Objects.equal(field, originalField)) {
+          filteredFields.add(field);
+          hasChange = true;
+        } else {
+          filteredFields.add(originalField);
+        }
       } else if (field != null) {
-        filteredFields.add(originalField);
+        filteredFields.add(field);
         hasChange = true;
       }
     }
@@ -115,16 +121,21 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
     Type originalElement = ParquetSchemaUtil.determineListElementType(list);
     Integer elementId = getId(originalElement);
 
-    if (elementId != null && selectedIds.contains(elementId)) {
+    if (element != null && !Objects.equal(element, originalElement)) {
+      GroupType prunedList =
+          originalElement.isRepetition(Type.Repetition.REPEATED)
+              ? list.withNewFields(element)
+              : list.withNewFields(repeated.asGroupType().withNewFields(element));
+
+      // pruning a 2-level list's repeated group to one field can make it read as a 3-level list
+      if (ParquetSchemaUtil.determineListElementType(prunedList).equals(element)) {
+        return prunedList;
+      }
+
+      return list;
+    } else if (elementId != null && selectedIds.contains(elementId)) {
       return list;
     } else if (element != null) {
-      if (!Objects.equal(element, originalElement)) {
-        if (originalElement.isRepetition(Type.Repetition.REPEATED)) {
-          return list.withNewFields(element);
-        } else {
-          return list.withNewFields(repeated.asGroupType().withNewFields(element));
-        }
-      }
       return list;
     }
 
@@ -140,13 +151,12 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
     Integer keyId = getId(originalKey);
     Integer valueId = getId(originalValue);
 
-    if ((keyId != null && selectedIds.contains(keyId))
+    if (value != null && !Objects.equal(value, originalValue)) {
+      return map.withNewFields(repeated.withNewFields(originalKey, value));
+    } else if ((keyId != null && selectedIds.contains(keyId))
         || (valueId != null && selectedIds.contains(valueId))) {
       return map;
     } else if (value != null) {
-      if (!Objects.equal(value, originalValue)) {
-        return map.withNewFields(repeated.withNewFields(originalKey, value));
-      }
       return map;
     }
 
@@ -170,13 +180,14 @@ class PruneColumns extends TypeWithSchemaVisitor<Type> {
   }
 
   private boolean isStruct(Type field, NestedField expected) {
-    if (field.isPrimitive() || expected.type().isVariantType()) {
+    if (field.isPrimitive()) {
       return false;
     } else {
       GroupType groupType = field.asGroupType();
       LogicalTypeAnnotation logicalTypeAnnotation = groupType.getLogicalTypeAnnotation();
       return !LogicalTypeAnnotation.mapType().equals(logicalTypeAnnotation)
-          && !LogicalTypeAnnotation.listType().equals(logicalTypeAnnotation);
+          && !LogicalTypeAnnotation.listType().equals(logicalTypeAnnotation)
+          && (expected == null || expected.type().isStructType());
     }
   }
 }
