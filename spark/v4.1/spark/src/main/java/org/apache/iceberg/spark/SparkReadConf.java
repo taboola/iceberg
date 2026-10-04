@@ -136,6 +136,14 @@ public class SparkReadConf {
         .parse();
   }
 
+  public boolean parquetSparkNativeNestedEnabled() {
+    return confParser
+        .booleanConf()
+        .sessionConf(SparkSQLProperties.PARQUET_SPARK_NATIVE_NESTED_ENABLED)
+        .defaultValue(SparkSQLProperties.PARQUET_SPARK_NATIVE_NESTED_ENABLED_DEFAULT)
+        .parse();
+  }
+
   public boolean orcVectorizationEnabled() {
     return confParser
         .booleanConf()

@@ -18,8 +18,10 @@
  */
 package org.apache.iceberg.spark.source;
 
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Supplier;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
@@ -29,21 +31,32 @@ import org.apache.iceberg.ScanTaskGroup;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.ResolvingFileIO;
 import org.apache.iceberg.spark.ImmutableOrcBatchReadConf;
 import org.apache.iceberg.spark.ImmutableParquetBatchReadConf;
 import org.apache.iceberg.spark.OrcBatchReadConf;
 import org.apache.iceberg.spark.ParquetBatchReadConf;
 import org.apache.iceberg.spark.SparkReadConf;
 import org.apache.iceberg.spark.SparkUtil;
+import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 class SparkBatch implements Batch {
+  private static final Logger LOG = LoggerFactory.getLogger(SparkBatch.class);
+  // Spark represents these types but reads their Parquet encoding differently from Iceberg
+  private static final Set<Type.TypeID> SPARK_UNSUPPORTED_TYPES =
+      EnumSet.of(Type.TypeID.UUID, Type.TypeID.UNKNOWN, Type.TypeID.VARIANT);
 
   private final JavaSparkContext sparkContext;
   private final Table table;
@@ -128,6 +141,9 @@ class SparkBatch implements Batch {
     if (useParquetBatchReads()) {
       return new SparkColumnarReaderFactory(parquetBatchReadConf());
 
+    } else if (useSparkNativeParquetReads()) {
+      return new SparkNativeParquetReaderFactory(projection, parquetBatchReadConf());
+
     } else if (useOrcBatchReads()) {
       return new SparkColumnarReaderFactory(orcBatchReadConf());
 
@@ -170,6 +186,105 @@ class SparkBatch implements Batch {
 
   private boolean supportsParquetBatchReads(Types.NestedField field) {
     return field.type().isPrimitiveType() || MetadataColumns.isMetadataColumn(field.fieldId());
+  }
+
+  // conditions for reading nested projections with Spark's vectorized Parquet reader:
+  // - the session flag is on and Parquet vectorization is enabled
+  // - the table has no name mapping (files are matched by field ID) and uses HadoopFileIO
+  // - the projection has no metadata columns, initial defaults or types Spark reads differently
+  // - Spark's own vectorized reader supports the projection
+  // - all tasks read Parquet data files without delete files or encryption
+  private boolean useSparkNativeParquetReads() {
+    if (!readConf.parquetSparkNativeNestedEnabled()) {
+      return false;
+    }
+
+    String blocker = sparkNativeReadsBlocker();
+    if (blocker != null) {
+      LOG.info("Not using Spark's vectorized Parquet reader for {}: {}", table.name(), blocker);
+      return false;
+    }
+
+    LOG.info(
+        "Reading {} ({} task groups) with Spark's vectorized Parquet reader",
+        table.name(),
+        taskGroups.size());
+    return true;
+  }
+
+  private String sparkNativeReadsBlocker() {
+    if (!readConf.parquetVectorizationEnabled()) {
+      return "Parquet vectorization is disabled";
+    }
+
+    if (table.properties().containsKey(TableProperties.DEFAULT_NAME_MAPPING)) {
+      return "the table has a name mapping";
+    }
+
+    // Spark's reader opens files through Hadoop, which is how HadoopFileIO opens them as well; a
+    // ResolvingFileIO qualifies when it routes every file of the scan to HadoopFileIO
+    FileIO io = fileIO.get();
+    if (!(io instanceof HadoopFileIO) && !(io instanceof ResolvingFileIO)) {
+      return "the FileIO is " + io.getClass().getName() + ", not HadoopFileIO";
+    }
+
+    String unsupportedColumn = unsupportedColumn();
+    if (unsupportedColumn != null) {
+      return unsupportedColumn;
+    }
+
+    if (!SparkNativeParquetReaderFactory.supportsProjection(projection)) {
+      return "Spark's vectorized Parquet reader does not support this projection";
+    }
+
+    return unsupportedTask(io);
+  }
+
+  private String unsupportedColumn() {
+    for (Types.NestedField field : TypeUtil.indexById(projection.asStruct()).values()) {
+      String name = projection.findColumnName(field.fieldId());
+      if (MetadataColumns.isMetadataColumn(field.fieldId())) {
+        return "column " + name + " is a metadata column";
+      } else if (field.initialDefault() != null) {
+        // Iceberg returns the default for files written before the column was added
+        return "column " + name + " has an initial default value";
+      } else if (SPARK_UNSUPPORTED_TYPES.contains(field.type().typeId())) {
+        return "column " + name + " has type " + field.type();
+      }
+    }
+
+    return null;
+  }
+
+  private String unsupportedTask(FileIO io) {
+    for (ScanTaskGroup<?> taskGroup : taskGroups) {
+      for (ScanTask task : taskGroup.tasks()) {
+        if (!supportsParquetBatchReads(task)) {
+          return "the scan has a task that is not a Parquet data file scan";
+        }
+
+        FileScanTask fileScanTask = task.asFileScanTask();
+        if (!fileScanTask.deletes().isEmpty()) {
+          return "file " + fileScanTask.file().location() + " has delete files";
+        }
+
+        if (fileScanTask.file().keyMetadata() != null) {
+          return "file " + fileScanTask.file().location() + " is encrypted";
+        }
+
+        if (!usesHadoopFileIO(io, fileScanTask.file().location())) {
+          return "file " + fileScanTask.file().location() + " is not read through HadoopFileIO";
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private static boolean usesHadoopFileIO(FileIO io, String location) {
+    return io instanceof HadoopFileIO
+        || (io instanceof ResolvingFileIO
+            && HadoopFileIO.class.isAssignableFrom(((ResolvingFileIO) io).ioClass(location)));
   }
 
   // conditions for using ORC batch reads:
