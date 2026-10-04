@@ -173,7 +173,6 @@ abstract class SparkScan implements Scan, SupportsReportStatistics {
   @Override
   public Batch toBatch() {
     return new SparkBatch(
-        spark,
         sparkContext,
         table,
         fileIO,

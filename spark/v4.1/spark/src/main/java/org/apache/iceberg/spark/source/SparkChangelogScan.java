@@ -48,7 +48,6 @@ class SparkChangelogScan implements Scan, SupportsReportStatistics {
 
   private static final Types.StructType EMPTY_GROUPING_KEY_TYPE = Types.StructType.of();
 
-  private final SparkSession spark;
   private final JavaSparkContext sparkContext;
   private final Table table;
   private final IncrementalChangelogScan scan;
@@ -72,7 +71,6 @@ class SparkChangelogScan implements Scan, SupportsReportStatistics {
 
     SparkSchemaUtil.validateMetadataColumnReferences(table.schema(), projection);
 
-    this.spark = spark;
     this.sparkContext = JavaSparkContext.fromSparkContext(spark.sparkContext());
     this.table = table;
     this.scan = scan;
@@ -105,7 +103,6 @@ class SparkChangelogScan implements Scan, SupportsReportStatistics {
   @Override
   public Batch toBatch() {
     return new SparkBatch(
-        spark,
         sparkContext,
         table,
         null != scan ? scan.fileIO() : table::io,

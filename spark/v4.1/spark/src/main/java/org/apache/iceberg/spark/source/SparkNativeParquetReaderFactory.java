@@ -19,33 +19,43 @@
 package org.apache.iceberg.spark.source;
 
 import java.io.IOException;
-import java.util.Iterator;
+import java.io.UncheckedIOException;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.UUID;
+import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.mapred.FileSplit;
+import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.hadoop.mapreduce.TaskAttemptID;
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl;
+import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.hadoop.HadoopConfigurable;
+import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.spark.ParquetBatchReadConf;
 import org.apache.iceberg.spark.SparkSchemaUtil;
+import org.apache.iceberg.spark.source.metrics.TaskNumDeletes;
+import org.apache.iceberg.spark.source.metrics.TaskNumSplits;
 import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
 import org.apache.parquet.hadoop.ParquetInputFormat;
 import org.apache.spark.TaskContext;
 import org.apache.spark.rdd.InputFileBlockHolder;
-import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.execution.datasources.parquet.ParquetReadSupport;
 import org.apache.spark.sql.execution.datasources.parquet.ParquetUtils;
 import org.apache.spark.sql.execution.datasources.parquet.VectorizedParquetRecordReader;
+import org.apache.spark.sql.internal.LegacyBehaviorPolicy;
 import org.apache.spark.sql.internal.SQLConf;
 import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataType;
@@ -58,29 +68,28 @@ import org.apache.spark.sql.vectorized.ColumnarBatch;
 
 /**
  * Reads Parquet scan tasks with Spark's vectorized Parquet reader, which, unlike Iceberg's
- * vectorized reader, decodes nested columns.
- *
- * <p>Columns are resolved by Iceberg field ID at every nesting level. Only used for scans that pass
- * the checks in {@link SparkBatch}: Parquet data files without deletes or encryption, a projection
- * without metadata columns, initial defaults or types Spark cannot represent, and a table whose
- * files are opened through Hadoop.
+ * vectorized reader, decodes nested columns. Columns are resolved by Iceberg field ID at every
+ * nesting level. Used only for scans that {@link SparkBatch} selects for it.
  */
 class SparkNativeParquetReaderFactory implements PartitionReaderFactory {
-  private static final String REBASE_MODE_CORRECTED = "CORRECTED";
+  private static final String REBASE_MODE = LegacyBehaviorPolicy.CORRECTED().toString();
 
   private final String requestedSchemaJson;
-  private final boolean caseSensitive;
   private final int batchSize;
   private final String sessionTimeZone;
   private final boolean offHeap;
 
-  SparkNativeParquetReaderFactory(SparkSession spark, Schema projection, int batchSize) {
-    SQLConf conf = spark.sessionState().conf();
+  SparkNativeParquetReaderFactory(Schema projection, ParquetBatchReadConf conf) {
+    SQLConf sqlConf = SQLConf.get();
     this.requestedSchemaJson = requestedSchema(projection).json();
-    this.caseSensitive = conf.caseSensitiveAnalysis();
-    this.batchSize = batchSize;
-    this.sessionTimeZone = conf.sessionLocalTimeZone();
-    this.offHeap = conf.offHeapColumnVectorEnabled();
+    this.batchSize = conf.batchSize();
+    this.sessionTimeZone = sqlConf.sessionLocalTimeZone();
+    this.offHeap = sqlConf.offHeapColumnVectorEnabled();
+  }
+
+  static boolean supportsProjection(Schema projection) {
+    return ParquetUtils.isBatchReadSupportedForSchema(
+        SQLConf.get(), SparkSchemaUtil.convert(projection));
   }
 
   // Spark resolves a file column by name before falling back to its field ID, so the requested
@@ -88,49 +97,7 @@ class SparkNativeParquetReaderFactory implements PartitionReaderFactory {
   // and the scan's output schema still comes from the Iceberg projection
   static StructType requestedSchema(Schema projection) {
     String nonce = UUID.randomUUID().toString().substring(0, 8);
-    return withFieldIds(projection.asStruct(), SparkSchemaUtil.convert(projection), nonce);
-  }
-
-  private static StructType withFieldIds(
-      Types.StructType struct, StructType sparkStruct, String nonce) {
-    List<Types.NestedField> fields = struct.fields();
-    StructField[] result = new StructField[fields.size()];
-    for (int i = 0; i < result.length; i += 1) {
-      Types.NestedField field = fields.get(i);
-      StructField sparkField = sparkStruct.fields()[i];
-      Metadata metadata =
-          new MetadataBuilder()
-              .withMetadata(sparkField.metadata())
-              .putLong(ParquetUtils.FIELD_ID_METADATA_KEY(), field.fieldId())
-              .build();
-      result[i] =
-          new StructField(
-              "_" + field.fieldId() + "_" + nonce,
-              withFieldIds(field.type(), sparkField.dataType(), nonce),
-              sparkField.nullable(),
-              metadata);
-    }
-
-    return new StructType(result);
-  }
-
-  private static DataType withFieldIds(Type type, DataType sparkType, String nonce) {
-    if (type.isStructType()) {
-      return withFieldIds(type.asStructType(), (StructType) sparkType, nonce);
-    } else if (type.isListType()) {
-      ArrayType array = (ArrayType) sparkType;
-      return new ArrayType(
-          withFieldIds(type.asListType().elementType(), array.elementType(), nonce),
-          array.containsNull());
-    } else if (type.isMapType()) {
-      MapType map = (MapType) sparkType;
-      return new MapType(
-          withFieldIds(type.asMapType().keyType(), map.keyType(), nonce),
-          withFieldIds(type.asMapType().valueType(), map.valueType(), nonce),
-          map.valueContainsNull());
-    }
-
-    return sparkType;
+    return (StructType) TypeUtil.visit(projection, new RequestedSchemaVisitor(nonce));
   }
 
   @Override
@@ -145,12 +112,11 @@ class SparkNativeParquetReaderFactory implements PartitionReaderFactory {
         "Unknown input partition type: %s",
         inputPartition.getClass().getName());
     SparkInputPartition partition = (SparkInputPartition) inputPartition;
-    FileIO io = partition.io();
-    Configuration conf =
-        io instanceof HadoopConfigurable ? ((HadoopConfigurable) io).getConf() : null;
-    Preconditions.checkNotNull(
-        conf, "FileIO %s has no Hadoop configuration", io.getClass().getName());
-    return new Reader(partition.<FileScanTask>taskGroup().tasks().iterator(), readerConf(conf));
+    Preconditions.checkArgument(
+        partition.allTasksOfType(FileScanTask.class),
+        "Unsupported task group for columnar reads: %s",
+        partition.taskGroup());
+    return new BatchReader(partition);
   }
 
   @Override
@@ -158,9 +124,14 @@ class SparkNativeParquetReaderFactory implements PartitionReaderFactory {
     return true;
   }
 
-  // the FileIO configuration is what Iceberg opens the same files with; the per-scan keys go on
-  // a copy so the broadcast configuration stays untouched
-  private Configuration readerConf(Configuration fileIOConf) {
+  // the FileIO configuration is what Iceberg opens the same files with; on executors the FileIO
+  // is a serializable wrapper that exposes the configuration of the HadoopFileIO checked on the
+  // driver, and the per-scan keys go on a copy so the broadcast configuration stays untouched
+  private Configuration readerConf(FileIO io, boolean caseSensitive) {
+    Preconditions.checkArgument(
+        io instanceof HadoopConfigurable, "FileIO %s has no Hadoop configuration", io);
+    Configuration fileIOConf = ((HadoopConfigurable) io).getConf();
+    Preconditions.checkNotNull(fileIOConf, "FileIO %s has no Hadoop configuration", io);
     Configuration conf = new Configuration(fileIOConf);
     conf.set(ParquetInputFormat.READ_SUPPORT_CLASS, ParquetReadSupport.class.getName());
     conf.set(ParquetReadSupport.SPARK_ROW_REQUESTED_SCHEMA(), requestedSchemaJson);
@@ -175,76 +146,171 @@ class SparkNativeParquetReaderFactory implements PartitionReaderFactory {
     return conf;
   }
 
-  private class Reader implements PartitionReader<ColumnarBatch> {
-    private final Iterator<FileScanTask> tasks;
-    private final Configuration conf;
-    private VectorizedParquetRecordReader current = null;
+  private static class RequestedSchemaVisitor extends TypeUtil.SchemaVisitor<DataType> {
+    private final String nonce;
 
-    Reader(Iterator<FileScanTask> tasks, Configuration conf) {
-      this.tasks = tasks;
-      this.conf = conf;
+    private RequestedSchemaVisitor(String nonce) {
+      this.nonce = nonce;
     }
 
     @Override
-    public boolean next() throws IOException {
-      while (true) {
-        if (current != null && current.nextBatch()) {
-          return true;
-        }
+    public DataType schema(Schema schema, DataType structType) {
+      return structType;
+    }
 
-        closeCurrent();
-        if (!tasks.hasNext()) {
-          return false;
-        }
-
-        open(tasks.next());
+    @Override
+    public DataType struct(Types.StructType struct, List<DataType> fieldTypes) {
+      List<Types.NestedField> fields = struct.fields();
+      StructField[] sparkFields = new StructField[fields.size()];
+      for (int i = 0; i < sparkFields.length; i += 1) {
+        Types.NestedField field = fields.get(i);
+        Metadata metadata =
+            new MetadataBuilder()
+                .putLong(ParquetUtils.FIELD_ID_METADATA_KEY(), field.fieldId())
+                .build();
+        sparkFields[i] =
+            new StructField(
+                "_" + field.fieldId() + "_" + nonce,
+                fieldTypes.get(i),
+                field.isOptional(),
+                metadata);
       }
+
+      return new StructType(sparkFields);
     }
 
     @Override
-    public ColumnarBatch get() {
-      return current.resultBatch();
+    public DataType field(Types.NestedField field, DataType fieldType) {
+      return fieldType;
     }
 
     @Override
-    public void close() throws IOException {
-      closeCurrent();
-      InputFileBlockHolder.unset();
+    public DataType list(Types.ListType list, DataType elementType) {
+      return new ArrayType(elementType, list.isElementOptional());
     }
 
-    private void open(FileScanTask task) throws IOException {
+    @Override
+    public DataType map(Types.MapType map, DataType keyType, DataType valueType) {
+      return new MapType(keyType, valueType, map.isValueOptional());
+    }
+
+    @Override
+    public DataType variant(Types.VariantType variant) {
+      return SparkSchemaUtil.convert(variant);
+    }
+
+    @Override
+    public DataType primitive(Type.PrimitiveType primitive) {
+      return SparkSchemaUtil.convert(primitive);
+    }
+  }
+
+  private class BatchReader extends BaseReader<ColumnarBatch, FileScanTask>
+      implements PartitionReader<ColumnarBatch> {
+    private final TaskAttemptContext context;
+    private final long numSplits;
+
+    private BatchReader(SparkInputPartition partition) {
+      super(
+          partition.table(),
+          partition.io(),
+          partition.taskGroup(),
+          partition.projection(),
+          partition.isCaseSensitive(),
+          partition.cacheDeleteFilesOnExecutors());
+      this.context =
+          new TaskAttemptContextImpl(
+              readerConf(partition.io(), partition.isCaseSensitive()), new TaskAttemptID());
+      this.numSplits = partition.taskGroup().tasks().size();
+    }
+
+    @Override
+    public CustomTaskMetric[] currentMetricsValues() {
+      return new CustomTaskMetric[] {new TaskNumSplits(numSplits), new TaskNumDeletes(0)};
+    }
+
+    @Override
+    protected Stream<ContentFile<?>> referencedFiles(FileScanTask task) {
+      return Stream.of(task.file());
+    }
+
+    @Override
+    protected CloseableIterator<ColumnarBatch> open(FileScanTask task) {
       String location = task.file().location();
       InputFileBlockHolder.set(location, task.start(), task.length());
       // Iceberg writes proleptic Gregorian dates and timestamps, so nothing is rebased
       VectorizedParquetRecordReader reader =
           new VectorizedParquetRecordReader(
               null,
-              REBASE_MODE_CORRECTED,
+              REBASE_MODE,
               sessionTimeZone,
-              REBASE_MODE_CORRECTED,
+              REBASE_MODE,
               sessionTimeZone,
               offHeap && TaskContext.get() != null,
               batchSize);
-      // assigned first so that close() also releases a reader that failed to open
-      this.current = reader;
       try {
         reader.initialize(
-            new FileSplit(new Path(location), task.start(), task.length(), new String[0]),
-            new TaskAttemptContextImpl(conf, new TaskAttemptID()));
+            new FileSplit(new Path(location), task.start(), task.length(), new String[0]), context);
+      } catch (IOException e) {
+        closeQuietly(reader);
+        throw new UncheckedIOException("Failed to open " + location, e);
       } catch (InterruptedException e) {
+        closeQuietly(reader);
         Thread.currentThread().interrupt();
-        throw new IOException(e);
+        throw new RuntimeException("Interrupted while opening " + location, e);
       }
 
       reader.initBatch(new StructType(), InternalRow.empty());
       reader.enableReturningBatches();
+      return new BatchIterator(reader);
+    }
+  }
+
+  private static void closeQuietly(VectorizedParquetRecordReader reader) {
+    try {
+      reader.close();
+    } catch (IOException ignored) {
+      // the open failure is the error to report
+    }
+  }
+
+  private static class BatchIterator implements CloseableIterator<ColumnarBatch> {
+    private final VectorizedParquetRecordReader reader;
+    private boolean advanced = false;
+    private boolean hasMore = false;
+
+    private BatchIterator(VectorizedParquetRecordReader reader) {
+      this.reader = reader;
     }
 
-    private void closeCurrent() throws IOException {
-      if (current != null) {
-        current.close();
-        this.current = null;
+    @Override
+    public boolean hasNext() {
+      if (!advanced) {
+        try {
+          this.hasMore = reader.nextBatch();
+        } catch (IOException e) {
+          throw new UncheckedIOException(e);
+        }
+
+        this.advanced = true;
       }
+
+      return hasMore;
+    }
+
+    @Override
+    public ColumnarBatch next() {
+      if (!hasNext()) {
+        throw new NoSuchElementException();
+      }
+
+      this.advanced = false;
+      return reader.resultBatch();
+    }
+
+    @Override
+    public void close() throws IOException {
+      reader.close();
     }
   }
 }

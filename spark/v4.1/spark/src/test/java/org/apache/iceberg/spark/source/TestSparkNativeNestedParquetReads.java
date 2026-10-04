@@ -25,11 +25,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.FileScanTask;
-import org.apache.iceberg.ParameterizedTestExtension;
-import org.apache.iceberg.Parameters;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
@@ -38,61 +37,35 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.mapping.MappingUtil;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
-import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.spark.SparkCatalogConfig;
 import org.apache.iceberg.spark.SparkSQLProperties;
 import org.apache.iceberg.spark.TestBaseWithCatalog;
-import org.apache.iceberg.types.Types.IntegerType;
-import org.apache.iceberg.types.Types.ListType;
-import org.apache.iceberg.types.Types.LongType;
-import org.apache.iceberg.types.Types.MapType;
-import org.apache.iceberg.types.Types.StringType;
-import org.apache.iceberg.types.Types.StructType;
-import org.apache.iceberg.types.Types.UUIDType;
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
+import org.apache.iceberg.types.Types;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.datasources.parquet.ParquetUtils;
 import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.MapType;
 import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.TestTemplate;
-import org.junit.jupiter.api.extension.ExtendWith;
 
-@ExtendWith(ParameterizedTestExtension.class)
-public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
-  private static final Map<String, String> NATIVE_READS_ON =
-      ImmutableMap.of(SparkSQLProperties.PARQUET_SPARK_NATIVE_NESTED_ENABLED, "true");
+class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
+  private static final String FLAG = SparkSQLProperties.PARQUET_SPARK_NATIVE_NESTED_ENABLED;
+  private static final Map<String, String> NATIVE_READS_ON = ImmutableMap.of(FLAG, "true");
   private static final int BATCH_SIZE = 2;
   private static final String EVENTS_TYPE =
       "array<struct<ts bigint, tags array<struct<k string, v double>>, attrs map<string, struct<n int>>>>";
   private static final String NESTED_PROJECTION =
       "struct<id:bigint,events:array<struct<ts:bigint,tags:array<struct<k:string,v:double>>>>,loc:struct<lat:double>>";
-
-  @Parameters(name = "catalogName = {0}, implementation = {1}, config = {2}")
-  public static Object[][] parameters() {
-    return new Object[][] {
-      {
-        SparkCatalogConfig.HADOOP.catalogName(),
-        SparkCatalogConfig.HADOOP.implementation(),
-        SparkCatalogConfig.HADOOP.properties()
-      }
-    };
-  }
-
-  @BeforeEach
-  void useCatalog() {
-    sql("USE %s", catalogName);
-  }
 
   @AfterEach
   void removeTable() {
@@ -102,36 +75,18 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
   @TestTemplate
   void nestedProjectionUsesSparkReader() {
     createNestedTable();
-    String nested =
-        String.format(
-            "SELECT id, events.ts AS ts, events.tags AS tags, loc.lat AS lat FROM %s ORDER BY id",
-            tableName);
-    String all = String.format("SELECT * FROM %s ORDER BY id", tableName);
-    List<Object[]> expectedNested = sql(nested);
-    List<Object[]> expectedAll = sql(all);
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () -> {
-          assertThat(readerFactory(NESTED_PROJECTION))
-              .isInstanceOf(SparkNativeParquetReaderFactory.class);
-          Dataset<Row> nestedRows = spark.sql(nested);
-          assertEquals("Nested projection", expectedNested, rowsToJava(nestedRows.collectAsList()));
-          assertThat(nestedRows.queryExecution().executedPlan().toString())
-              .contains("ColumnarToRow");
-          assertEquals("Full projection", expectedAll, sql(all));
-        });
+    assertReaderFactory(NESTED_PROJECTION, SparkNativeParquetReaderFactory.class);
+    assertNativePlanMatches(
+        "SELECT id, events.ts AS ts, events.tags AS tags, loc.lat AS lat FROM %s ORDER BY id");
+    assertNativeReadMatches("SELECT * FROM %s ORDER BY id");
   }
 
   @TestTemplate
   void flatProjectionKeepsIcebergVectorizedReader() {
     createNestedTable();
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () ->
-            assertThat(readerFactory("struct<id:bigint,name:string>"))
-                .isInstanceOf(SparkColumnarReaderFactory.class));
+    assertReaderFactory("struct<id:bigint,name:string>", SparkColumnarReaderFactory.class);
   }
 
   @TestTemplate
@@ -142,22 +97,21 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
   }
 
   @TestTemplate
-  void fallsBackWhenSparkVectorizationIsOff() {
+  void fallsBackWhenSparkVectorizedReaderIsOff() {
     createNestedTable();
 
     withSQLConf(
-        ImmutableMap.<String, String>builder()
-            .putAll(NATIVE_READS_ON)
-            .put("spark.sql.parquet.enableVectorizedReader", "false")
-            .buildOrThrow(),
+        nativeReadsWith("spark.sql.parquet.enableVectorizedReader", "false"),
         () ->
             assertThat(readerFactory(NESTED_PROJECTION)).isInstanceOf(SparkRowReaderFactory.class));
+  }
+
+  @TestTemplate
+  void fallsBackWhenSparkNestedVectorizationIsOff() {
+    createNestedTable();
 
     withSQLConf(
-        ImmutableMap.<String, String>builder()
-            .putAll(NATIVE_READS_ON)
-            .put("spark.sql.parquet.enableNestedColumnVectorizedReader", "false")
-            .buildOrThrow(),
+        nativeReadsWith("spark.sql.parquet.enableNestedColumnVectorizedReader", "false"),
         () ->
             assertThat(readerFactory(NESTED_PROJECTION)).isInstanceOf(SparkRowReaderFactory.class));
   }
@@ -169,26 +123,17 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
         "ALTER TABLE %s SET TBLPROPERTIES ('%s'='merge-on-read')",
         tableName, TableProperties.DELETE_MODE);
     sql("DELETE FROM %s WHERE id = 2", tableName);
-    String query = String.format("SELECT id, events.ts AS ts FROM %s ORDER BY id", tableName);
-    List<Object[]> expected = sql(query);
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () -> {
-          assertThat(readerFactory(NESTED_PROJECTION)).isInstanceOf(SparkRowReaderFactory.class);
-          assertEquals("Rows after delete", expected, sql(query));
-        });
+    assertReaderFactory(NESTED_PROJECTION, SparkRowReaderFactory.class);
+    assertNativeReadMatches("SELECT id, events.ts AS ts FROM %s ORDER BY id");
   }
 
   @TestTemplate
   void fallsBackForMetadataColumn() {
     createNestedTable();
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () ->
-            assertThat(readerFactory("struct<_file:string,events:array<struct<ts:bigint>>>"))
-                .isInstanceOf(SparkRowReaderFactory.class));
+    assertReaderFactory(
+        "struct<_file:string,events:array<struct<ts:bigint>>>", SparkRowReaderFactory.class);
   }
 
   @TestTemplate
@@ -202,26 +147,19 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
             NameMappingParser.toJson(MappingUtil.create(table.schema())))
         .commit();
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () ->
-            assertThat(readerFactory(NESTED_PROJECTION)).isInstanceOf(SparkRowReaderFactory.class));
+    assertReaderFactory(NESTED_PROJECTION, SparkRowReaderFactory.class);
   }
 
   @TestTemplate
-  void fallsBackForTypeSparkCannotRead() {
+  void fallsBackForTypeSparkReadsDifferently() {
     validationCatalog.createTable(
         tableIdent,
         new Schema(
-            required(1, "id", LongType.get()),
-            optional(2, "s", StructType.of(optional(3, "u", UUIDType.get())))),
+            required(1, "id", Types.LongType.get()),
+            optional(2, "s", Types.StructType.of(optional(3, "u", Types.UUIDType.get())))),
         PartitionSpec.unpartitioned());
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () ->
-            assertThat(readerFactory("struct<id:bigint,s:struct<u:string>>"))
-                .isInstanceOf(SparkRowReaderFactory.class));
+    assertReaderFactory("struct<id:bigint,s:struct<u:string>>", SparkRowReaderFactory.class);
   }
 
   @TestTemplate
@@ -235,24 +173,28 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
     sql("ALTER TABLE %s ALTER COLUMN events.element.extra FIRST", tableName);
     sql("ALTER TABLE %s DROP COLUMN name", tableName);
     sql("INSERT INTO %s (id, note) VALUES (9, 'n')", tableName);
-    String query =
-        String.format(
-            "SELECT id, events.at AS at, events.extra AS extra, loc.alt AS alt, note FROM %s ORDER BY id",
-            tableName);
-    String all = String.format("SELECT * FROM %s ORDER BY id", tableName);
-    List<Object[]> expected = sql(query);
-    List<Object[]> expectedAll = sql(all);
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () -> {
-          assertThat(
-                  readerFactory(
-                      "struct<id:bigint,events:array<struct<at:bigint,extra:int>>,loc:struct<alt:double>,note:string>"))
-              .isInstanceOf(SparkNativeParquetReaderFactory.class);
-          assertEquals("Rows across schema versions", expected, sql(query));
-          assertEquals("Reordered columns", expectedAll, sql(all));
-        });
+    assertReaderFactory(
+        "struct<id:bigint,events:array<struct<at:bigint,extra:int>>,loc:struct<alt:double>,note:string>",
+        SparkNativeParquetReaderFactory.class);
+    assertNativeReadMatches(
+        "SELECT id, events.at AS at, events.extra AS extra, loc.alt AS alt, note FROM %s ORDER BY id");
+    assertNativeReadMatches("SELECT * FROM %s ORDER BY id");
+  }
+
+  @TestTemplate
+  void typePromotionResolvesByFieldId() {
+    sql("CREATE TABLE %s (id int, n int, f float, s struct<m int>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, 10, 1.5, named_struct('m', 3))", tableName);
+    sql("ALTER TABLE %s ALTER COLUMN n TYPE bigint", tableName);
+    sql("ALTER TABLE %s ALTER COLUMN f TYPE double", tableName);
+    sql("ALTER TABLE %s ALTER COLUMN s.m TYPE bigint", tableName);
+    sql("INSERT INTO %s VALUES (2, 20, 2.5, named_struct('m', 4))", tableName);
+
+    assertReaderFactory(
+        "struct<id:int,n:bigint,f:double,s:struct<m:bigint>>",
+        SparkNativeParquetReaderFactory.class);
+    assertNativeReadMatches("SELECT * FROM %s ORDER BY id");
   }
 
   @TestTemplate
@@ -263,34 +205,19 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
     sql(
         "INSERT INTO %s VALUES (1, 'd1', array(named_struct('ts', 10L))), (2, 'd2', array(named_struct('ts', 20L), named_struct('ts', CAST(NULL AS bigint)))), (3, 'd1', CAST(NULL AS array<struct<ts bigint>>))",
         tableName);
-    String query = String.format("SELECT id, dt, events.ts AS ts FROM %s ORDER BY id", tableName);
-    List<Object[]> expected = sql(query);
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () -> {
-          assertThat(readerFactory("struct<id:bigint,dt:string,events:array<struct<ts:bigint>>>"))
-              .isInstanceOf(SparkNativeParquetReaderFactory.class);
-          assertEquals("Partitioned rows", expected, sql(query));
-        });
+    assertReaderFactory(
+        "struct<id:bigint,dt:string,events:array<struct<ts:bigint>>>",
+        SparkNativeParquetReaderFactory.class);
+    assertNativeReadMatches("SELECT id, dt, events.ts AS ts FROM %s ORDER BY id");
   }
 
   @TestTemplate
   void filtersAreAppliedOnTheNativePath() {
     createNestedTable();
-    String query =
-        String.format(
-            "SELECT id, events.ts AS ts FROM %s WHERE id > 1 AND (name = 'd' OR loc.lon > 3.0) ORDER BY id",
-            tableName);
-    List<Object[]> expected = sql(query);
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () -> {
-          Dataset<Row> rows = spark.sql(query);
-          assertEquals("Filtered rows", expected, rowsToJava(rows.collectAsList()));
-          assertThat(rows.queryExecution().executedPlan().toString()).contains("ColumnarToRow");
-        });
+    assertNativePlanMatches(
+        "SELECT id, events.ts AS ts FROM %s WHERE id > 1 AND (name = 'd' OR loc.lon > 3.0) ORDER BY id");
   }
 
   @TestTemplate
@@ -305,22 +232,18 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
         TableProperties.SPLIT_SIZE,
         TableProperties.PARQUET_BATCH_SIZE);
     sql("INSERT INTO %s SELECT id, array(named_struct('ts', id * 10)) FROM range(20)", tableName);
-    String query = String.format("SELECT id, events.ts AS ts FROM %s ORDER BY id", tableName);
-    List<Object[]> expected = sql(query);
-    assertThat(expected).hasSize(20);
+    Map<String, String> conf =
+        nativeReadsWith(SparkSQLProperties.READ_ADAPTIVE_SPLIT_SIZE_ENABLED, "false");
 
     withSQLConf(
-        ImmutableMap.<String, String>builder()
-            .putAll(NATIVE_READS_ON)
-            .put(SparkSQLProperties.READ_ADAPTIVE_SPLIT_SIZE_ENABLED, "false")
-            .buildOrThrow(),
+        conf,
         () -> {
           Batch batch = scan("struct<id:bigint,events:array<struct<ts:bigint>>>").toBatch();
           assertThat(batch.createReaderFactory())
               .isInstanceOf(SparkNativeParquetReaderFactory.class);
           assertThat(batch.planInputPartitions().length).isGreaterThan(1);
-          assertEquals("Rows across splits", expected, sql(query));
         });
+    assertNativeReadMatches(conf, "SELECT id, events.ts AS ts FROM %s ORDER BY id");
   }
 
   @TestTemplate
@@ -335,52 +258,20 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
             + "TIMESTAMP_NTZ '2024-01-02 03:04:05.123456', 12.34, 123456789012345.6789, X'0102', named_struct('n', 7)), "
             + "(2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, named_struct('n', CAST(NULL AS int)))",
         tableName);
-    String query = String.format("SELECT * FROM %s ORDER BY id", tableName);
-    List<Object[]> expected = sql(query);
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () -> {
-          assertThat(
-                  readerFactory(
-                      "struct<id:int,f:float,d:date,ts:timestamp,tsn:timestamp_ntz,dec:decimal(9,2),bigdec:decimal(20,4),bin:binary,s:struct<n:int>>"))
-              .isInstanceOf(SparkNativeParquetReaderFactory.class);
-          assertEquals("All primitive types", expected, sql(query));
-        });
+    assertReaderFactory(
+        "struct<id:int,f:float,d:date,ts:timestamp,tsn:timestamp_ntz,dec:decimal(9,2),bigdec:decimal(20,4),bin:binary,s:struct<n:int>>",
+        SparkNativeParquetReaderFactory.class);
+    assertNativeReadMatches("SELECT * FROM %s ORDER BY id");
   }
 
   @TestTemplate
   void offHeapVectorsMatchTheRowReader() {
     createNestedTable();
-    String query = String.format("SELECT * FROM %s ORDER BY id", tableName);
-    List<Object[]> expected = sql(query);
 
-    withSQLConf(
-        ImmutableMap.<String, String>builder()
-            .putAll(NATIVE_READS_ON)
-            .put("spark.sql.columnVector.offheap.enabled", "true")
-            .buildOrThrow(),
-        () -> assertEquals("Off-heap rows", expected, sql(query)));
-  }
-
-  @TestTemplate
-  void typePromotionResolvesByFieldId() {
-    sql("CREATE TABLE %s (id int, n int, f float, s struct<m int>) USING iceberg", tableName);
-    sql("INSERT INTO %s VALUES (1, 10, 1.5, named_struct('m', 3))", tableName);
-    sql("ALTER TABLE %s ALTER COLUMN n TYPE bigint", tableName);
-    sql("ALTER TABLE %s ALTER COLUMN f TYPE double", tableName);
-    sql("ALTER TABLE %s ALTER COLUMN s.m TYPE bigint", tableName);
-    sql("INSERT INTO %s VALUES (2, 20, 2.5, named_struct('m', 4))", tableName);
-    String query = String.format("SELECT * FROM %s ORDER BY id", tableName);
-    List<Object[]> expected = sql(query);
-
-    withSQLConf(
-        NATIVE_READS_ON,
-        () -> {
-          assertThat(readerFactory("struct<id:int,n:bigint,f:double,s:struct<m:bigint>>"))
-              .isInstanceOf(SparkNativeParquetReaderFactory.class);
-          assertEquals("Promoted columns", expected, sql(query));
-        });
+    assertNativeReadMatches(
+        nativeReadsWith("spark.sql.columnVector.offheap.enabled", "true"),
+        "SELECT * FROM %s ORDER BY id");
   }
 
   @TestTemplate
@@ -408,10 +299,9 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
         () -> {
           Batch batch = scan("struct<id:bigint,events:array<struct<ts:bigint>>>").toBatch();
           PartitionReaderFactory factory = batch.createReaderFactory();
-          InputPartition[] partitions = batch.planInputPartitions();
           int batches = 0;
           long rows = 0;
-          for (InputPartition partition : partitions) {
+          for (InputPartition partition : batch.planInputPartitions()) {
             assertThat(factory.supportColumnarReads(partition)).isTrue();
             try (PartitionReader<ColumnarBatch> reader = factory.createColumnarReader(partition)) {
               while (reader.next()) {
@@ -425,7 +315,20 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
 
           assertThat(rows).isEqualTo(rowCount);
           assertThat(batches).isEqualTo(batchCount);
-          assertThatThrownBy(() -> factory.createReader(partitions[0]))
+        });
+  }
+
+  @TestTemplate
+  void rowReadsAreNotSupported() {
+    createNestedTable();
+
+    withSQLConf(
+        NATIVE_READS_ON,
+        () -> {
+          Batch batch = scan(NESTED_PROJECTION).toBatch();
+          PartitionReaderFactory factory = batch.createReaderFactory();
+          InputPartition partition = batch.planInputPartitions()[0];
+          assertThatThrownBy(() -> factory.createReader(partition))
               .isInstanceOf(UnsupportedOperationException.class)
               .hasMessage("Row-based reads are not supported");
         });
@@ -434,71 +337,61 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
   @TestTemplate
   void metadataTablesAndChangelogKeepIcebergReaders() {
     createNestedTable();
-    String files =
-        String.format("SELECT file_path, record_count FROM %s.files ORDER BY file_path", tableName);
-    String changes =
-        String.format("SELECT id, _change_type FROM %s.changes ORDER BY id", tableName);
-    List<Object[]> expectedFiles = sql(files);
-    List<Object[]> expectedChanges = sql(changes);
 
-    withSQLConf(
-        NATIVE_READS_ON,
-        () -> {
-          assertEquals("Files metadata table", expectedFiles, sql(files));
-          assertEquals("Changelog rows", expectedChanges, sql(changes));
-        });
+    assertNativeReadMatches("SELECT file_path, record_count FROM %s.files ORDER BY file_path");
+    assertNativeReadMatches("SELECT id, _change_type FROM %s.changes ORDER BY id");
   }
 
   @TestTemplate
   void requestedSchemaCarriesFieldIdsAndSyntheticNames() {
     Schema schema =
         new Schema(
-            required(1, "id", LongType.get()),
+            required(1, "id", Types.LongType.get()),
             optional(
                 2,
                 "events",
-                ListType.ofOptional(
+                Types.ListType.ofOptional(
                     3,
-                    StructType.of(
-                        optional(4, "ts", LongType.get()),
+                    Types.StructType.of(
+                        optional(4, "ts", Types.LongType.get()),
                         optional(
                             5,
                             "attrs",
-                            MapType.ofOptional(
+                            Types.MapType.ofOptional(
                                 6,
                                 7,
-                                StringType.get(),
-                                StructType.of(optional(8, "n", IntegerType.get()))))))));
+                                Types.StringType.get(),
+                                Types.StructType.of(
+                                    optional(8, "n", Types.IntegerType.get()))))))));
 
-    org.apache.spark.sql.types.StructType requested =
-        SparkNativeParquetReaderFactory.requestedSchema(schema);
+    StructType requested = SparkNativeParquetReaderFactory.requestedSchema(schema);
 
-    List<Long> ids = Lists.newArrayList();
-    List<String> names = Lists.newArrayList();
-    collect(requested, ids, names);
-    assertThat(ids).containsExactly(1L, 2L, 4L, 5L, 8L);
-    assertThat(names).allMatch(name -> name.matches("_\\d+_[0-9a-f]{8}"));
-    assertThat(requested.fields()[0].dataType()).isEqualTo(DataTypes.LongType);
-    assertThat(requested.fields()[1].dataType()).isInstanceOf(ArrayType.class);
+    StructField id = requested.fields()[0];
+    assertThat(fieldId(id)).isEqualTo(1L);
+    assertThat(id.name()).matches("_1_[0-9a-f]{8}");
+    assertThat(id.dataType()).isEqualTo(DataTypes.LongType);
+    assertThat(id.nullable()).isFalse();
+
+    StructField events = requested.fields()[1];
+    assertThat(fieldId(events)).isEqualTo(2L);
+    StructType element = (StructType) ((ArrayType) events.dataType()).elementType();
+    assertThat(fieldIds(element)).containsExactly(4L, 5L);
+    DataType value = ((MapType) element.fields()[1].dataType()).valueType();
+    assertThat(fieldIds((StructType) value)).containsExactly(8L);
+    assertThat(Arrays.stream(element.fields()).map(StructField::name))
+        .allMatch(name -> name.matches("_\\d+_[0-9a-f]{8}"));
   }
 
-  private static void collect(
-      org.apache.spark.sql.types.StructType struct, List<Long> ids, List<String> names) {
-    for (StructField field : struct.fields()) {
-      ids.add(field.metadata().getLong(ParquetUtils.FIELD_ID_METADATA_KEY()));
-      names.add(field.name());
-      collect(field.dataType(), ids, names);
-    }
+  private static long fieldId(StructField field) {
+    return field.metadata().getLong(ParquetUtils.FIELD_ID_METADATA_KEY());
   }
 
-  private static void collect(DataType type, List<Long> ids, List<String> names) {
-    if (type instanceof org.apache.spark.sql.types.StructType) {
-      collect((org.apache.spark.sql.types.StructType) type, ids, names);
-    } else if (type instanceof ArrayType) {
-      collect(((ArrayType) type).elementType(), ids, names);
-    } else if (type instanceof org.apache.spark.sql.types.MapType) {
-      collect(((org.apache.spark.sql.types.MapType) type).valueType(), ids, names);
-    }
+  private static List<Long> fieldIds(StructType struct) {
+    return Arrays.stream(struct.fields()).map(TestSparkNativeNestedParquetReads::fieldId).toList();
+  }
+
+  private static Map<String, String> nativeReadsWith(String key, String value) {
+    return ImmutableMap.of(FLAG, "true", key, value);
   }
 
   private void createNestedTable() {
@@ -518,6 +411,32 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
         tableName, EVENTS_TYPE);
   }
 
+  private void assertReaderFactory(String projection, Class<?> expected) {
+    withSQLConf(
+        NATIVE_READS_ON, () -> assertThat(readerFactory(projection)).isInstanceOf(expected));
+  }
+
+  private void assertNativeReadMatches(String query) {
+    assertNativeReadMatches(NATIVE_READS_ON, query);
+  }
+
+  private void assertNativeReadMatches(Map<String, String> conf, String query) {
+    String statement = String.format(query, tableName);
+    List<Object[]> expected = sql(statement);
+    withSQLConf(conf, () -> assertEquals(query, expected, sql(statement)));
+  }
+
+  private void assertNativePlanMatches(String query) {
+    String statement = String.format(query, tableName);
+    List<Object[]> expected = sql(statement);
+    withSQLConf(
+        NATIVE_READS_ON,
+        () -> {
+          SparkPlan plan = executeAndKeepPlan(() -> assertEquals(query, expected, sql(statement)));
+          assertThat(plan.toString()).contains("ColumnarToRow");
+        });
+  }
+
   private PartitionReaderFactory readerFactory(String projection) {
     return scan(projection).toBatch().createReaderFactory();
   }
@@ -525,7 +444,7 @@ public class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
   private Scan scan(String projection) {
     Table table = validationCatalog.loadTable(tableIdent);
     SparkScanBuilder builder = new SparkScanBuilder(spark, table, CaseInsensitiveStringMap.empty());
-    builder.pruneColumns((org.apache.spark.sql.types.StructType) DataType.fromDDL(projection));
+    builder.pruneColumns((StructType) DataType.fromDDL(projection));
     return builder.build();
   }
 }
