@@ -34,12 +34,16 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.ResolvingFileIO;
 import org.apache.iceberg.mapping.MappingUtil;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.spark.Spark3Util;
+import org.apache.iceberg.spark.SparkCatalog;
 import org.apache.iceberg.spark.SparkSQLProperties;
 import org.apache.iceberg.spark.TestBaseWithCatalog;
 import org.apache.iceberg.types.Types;
+import org.apache.spark.SparkException;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReader;
@@ -62,6 +66,7 @@ class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
   private static final String FLAG = SparkSQLProperties.PARQUET_SPARK_NATIVE_NESTED_ENABLED;
   private static final Map<String, String> NATIVE_READS_ON = ImmutableMap.of(FLAG, "true");
   private static final int BATCH_SIZE = 2;
+  private static final String SOURCE_TABLE = "spark_catalog.default.source";
   private static final String EVENTS_TYPE =
       "array<struct<ts bigint, tags array<struct<k string, v double>>, attrs map<string, struct<n int>>>>";
   private static final String NESTED_PROJECTION =
@@ -70,6 +75,7 @@ class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
   @AfterEach
   void removeTable() {
     sql("DROP TABLE IF EXISTS %s", tableName);
+    sql("DROP TABLE IF EXISTS %s", SOURCE_TABLE);
   }
 
   @TestTemplate
@@ -166,8 +172,9 @@ class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
   void schemaEvolutionResolvesByFieldId() {
     createNestedTable();
     sql("ALTER TABLE %s RENAME COLUMN events.element.ts TO at", tableName);
+    // the new ts column takes the old name of the renamed column but has its own ID
     sql(
-        "ALTER TABLE %s ADD COLUMNS (events.element.extra int, loc.alt double, note string)",
+        "ALTER TABLE %s ADD COLUMNS (events.element.extra int, events.element.ts int, loc.alt double, note string)",
         tableName);
     sql("ALTER TABLE %s ALTER COLUMN note FIRST", tableName);
     sql("ALTER TABLE %s ALTER COLUMN events.element.extra FIRST", tableName);
@@ -175,24 +182,34 @@ class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
     sql("INSERT INTO %s (id, note) VALUES (9, 'n')", tableName);
 
     assertReaderFactory(
-        "struct<id:bigint,events:array<struct<at:bigint,extra:int>>,loc:struct<alt:double>,note:string>",
+        "struct<id:bigint,events:array<struct<at:bigint,extra:int,ts:int>>,loc:struct<alt:double>,note:string>",
         SparkNativeParquetReaderFactory.class);
     assertNativeReadMatches(
-        "SELECT id, events.at AS at, events.extra AS extra, loc.alt AS alt, note FROM %s ORDER BY id");
+        "SELECT id, events.at AS at, events.extra AS extra, events.ts AS ts, loc.alt AS alt, note FROM %s ORDER BY id");
     assertNativeReadMatches("SELECT * FROM %s ORDER BY id");
   }
 
   @TestTemplate
   void typePromotionResolvesByFieldId() {
-    sql("CREATE TABLE %s (id int, n int, f float, s struct<m int>) USING iceberg", tableName);
-    sql("INSERT INTO %s VALUES (1, 10, 1.5, named_struct('m', 3))", tableName);
+    sql(
+        "CREATE TABLE %s (id int, n int, f float, d1 decimal(9,2), d2 decimal(9,2), s struct<m int, p decimal(18,4)>) USING iceberg",
+        tableName);
+    sql(
+        "INSERT INTO %s VALUES (1, 10, 1.5, 12.34, 56.78, named_struct('m', 3, 'p', 1.2345))",
+        tableName);
     sql("ALTER TABLE %s ALTER COLUMN n TYPE bigint", tableName);
     sql("ALTER TABLE %s ALTER COLUMN f TYPE double", tableName);
+    // int, long and fixed-length binary decimals
+    sql("ALTER TABLE %s ALTER COLUMN d1 TYPE decimal(12,2)", tableName);
+    sql("ALTER TABLE %s ALTER COLUMN d2 TYPE decimal(20,2)", tableName);
     sql("ALTER TABLE %s ALTER COLUMN s.m TYPE bigint", tableName);
-    sql("INSERT INTO %s VALUES (2, 20, 2.5, named_struct('m', 4))", tableName);
+    sql("ALTER TABLE %s ALTER COLUMN s.p TYPE decimal(38,4)", tableName);
+    sql(
+        "INSERT INTO %s VALUES (2, 20, 2.5, 1234567890.12, 123456789012345678.12, named_struct('m', 4, 'p', 12345678901234567890.1234))",
+        tableName);
 
     assertReaderFactory(
-        "struct<id:int,n:bigint,f:double,s:struct<m:bigint>>",
+        "struct<id:int,n:bigint,f:double,d1:decimal(12,2),d2:decimal(20,2),s:struct<m:bigint,p:decimal(38,4)>>",
         SparkNativeParquetReaderFactory.class);
     assertNativeReadMatches("SELECT * FROM %s ORDER BY id");
   }
@@ -210,6 +227,68 @@ class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
         "struct<id:bigint,dt:string,events:array<struct<ts:bigint>>>",
         SparkNativeParquetReaderFactory.class);
     assertNativeReadMatches("SELECT id, dt, events.ts AS ts FROM %s ORDER BY id");
+  }
+
+  @TestTemplate
+  void filesWithoutFieldIdsFailInsteadOfReadingNulls() {
+    // Hive-style Parquet files carry neither field IDs nor the identity partition column
+    sql(
+        "CREATE TABLE %s (id bigint, events array<struct<ts bigint>>, dt string) USING parquet PARTITIONED BY (dt)",
+        SOURCE_TABLE);
+    sql(
+        "INSERT INTO %s VALUES (1, array(named_struct('ts', 10L)), 'd1'), (2, array(), 'd2')",
+        SOURCE_TABLE);
+    sql(
+        "CREATE TABLE %s (id bigint, events array<struct<ts bigint>>, dt string) USING iceberg PARTITIONED BY (dt)",
+        tableName);
+    sql(
+        "CALL %s.system.add_files(table => '%s', source_table => '%s')",
+        catalogName, tableName, SOURCE_TABLE);
+    String projection = "struct<id:bigint,events:array<struct<ts:bigint>>,dt:string>";
+    String query = "SELECT id, events.ts AS ts, dt FROM %s ORDER BY id";
+
+    // the name mapping that add_files sets keeps the scan on the Iceberg readers
+    assertReaderFactory(projection, SparkRowReaderFactory.class);
+    assertNativeReadMatches(query);
+
+    sql(
+        "ALTER TABLE %s UNSET TBLPROPERTIES ('%s')",
+        tableName, TableProperties.DEFAULT_NAME_MAPPING);
+    assertReaderFactory(projection, SparkNativeParquetReaderFactory.class);
+    withSQLConf(
+        NATIVE_READS_ON,
+        () ->
+            assertThatThrownBy(() -> sql(query, tableName))
+                .isInstanceOf(SparkException.class)
+                .hasMessageContaining("Parquet file schema doesn't contain any field Ids"));
+  }
+
+  @TestTemplate
+  void resolvingFileIOOverHadoopUsesSparkReader() throws Exception {
+    createNestedTable();
+    String prefix = "spark.sql.catalog." + catalogName + ".";
+    spark.conf().set("spark.sql.catalog.resolving", SparkCatalog.class.getName());
+    catalogConfig.forEach(
+        (key, value) -> spark.conf().set("spark.sql.catalog.resolving." + key, value));
+    if (spark.conf().contains(prefix + "warehouse")) {
+      spark
+          .conf()
+          .set("spark.sql.catalog.resolving.warehouse", spark.conf().get(prefix + "warehouse"));
+    }
+
+    spark.conf().set("spark.sql.catalog.resolving.io-impl", ResolvingFileIO.class.getName());
+    Table table = Spark3Util.loadIcebergTable(spark, "resolving.default.table");
+    assertThat(table.io()).isInstanceOf(ResolvingFileIO.class);
+
+    withSQLConf(
+        NATIVE_READS_ON,
+        () ->
+            assertThat(scan(table, NESTED_PROJECTION).toBatch().createReaderFactory())
+                .isInstanceOf(SparkNativeParquetReaderFactory.class));
+    String query =
+        "SELECT id, events.ts AS ts, loc.lat AS lat FROM resolving.default.table ORDER BY id";
+    List<Object[]> expected = sql(query);
+    withSQLConf(NATIVE_READS_ON, () -> assertEquals(query, expected, sql(query)));
   }
 
   @TestTemplate
@@ -442,7 +521,10 @@ class TestSparkNativeNestedParquetReads extends TestBaseWithCatalog {
   }
 
   private Scan scan(String projection) {
-    Table table = validationCatalog.loadTable(tableIdent);
+    return scan(validationCatalog.loadTable(tableIdent), projection);
+  }
+
+  private Scan scan(Table table, String projection) {
     SparkScanBuilder builder = new SparkScanBuilder(spark, table, CaseInsensitiveStringMap.empty());
     builder.pruneColumns((StructType) DataType.fromDDL(projection));
     return builder.build();

@@ -92,8 +92,9 @@ class SparkNativeParquetReaderFactory implements PartitionReaderFactory {
         SQLConf.get(), SparkSchemaUtil.convert(projection));
   }
 
-  // Spark resolves a file column by name before falling back to its field ID, so the requested
-  // schema carries the Iceberg IDs and names that cannot occur in a file; batches are positional
+  // Spark clips the file schema by field ID, but its schema converter then maps the clipped file
+  // columns onto the requested fields by name before falling back to the ID, so the requested
+  // schema carries the Iceberg IDs under names that cannot occur in a file; batches are positional
   // and the scan's output schema still comes from the Iceberg projection
   static StructType requestedSchema(Schema projection) {
     String nonce = UUID.randomUUID().toString().substring(0, 8);
@@ -125,8 +126,9 @@ class SparkNativeParquetReaderFactory implements PartitionReaderFactory {
   }
 
   // the FileIO configuration is what Iceberg opens the same files with; on executors the FileIO
-  // is a serializable wrapper that exposes the configuration of the HadoopFileIO checked on the
-  // driver, and the per-scan keys go on a copy so the broadcast configuration stays untouched
+  // is a serializable wrapper that exposes the configuration of the Hadoop-backed FileIO checked
+  // on the driver, and the per-scan keys go on a copy so the broadcast configuration stays
+  // untouched
   private Configuration readerConf(FileIO io, boolean caseSensitive) {
     Preconditions.checkArgument(
         io instanceof HadoopConfigurable, "FileIO %s has no Hadoop configuration", io);

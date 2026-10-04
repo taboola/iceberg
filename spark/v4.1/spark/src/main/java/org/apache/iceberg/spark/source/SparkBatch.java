@@ -34,6 +34,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.ResolvingFileIO;
 import org.apache.iceberg.spark.ImmutableOrcBatchReadConf;
 import org.apache.iceberg.spark.ImmutableParquetBatchReadConf;
 import org.apache.iceberg.spark.OrcBatchReadConf;
@@ -200,12 +201,12 @@ class SparkBatch implements Batch {
 
     String blocker = sparkNativeReadsBlocker();
     if (blocker != null) {
-      LOG.info("[NATIVE-NESTED] Not used for {}: {}", table.name(), blocker);
+      LOG.info("Not using Spark's vectorized Parquet reader for {}: {}", table.name(), blocker);
       return false;
     }
 
     LOG.info(
-        "[NATIVE-NESTED] Reading {} ({} task groups) with Spark's vectorized Parquet reader",
+        "Reading {} ({} task groups) with Spark's vectorized Parquet reader",
         table.name(),
         taskGroups.size());
     return true;
@@ -220,9 +221,10 @@ class SparkBatch implements Batch {
       return "the table has a name mapping";
     }
 
-    // Spark's reader opens files through Hadoop, which is how HadoopFileIO opens them as well
+    // Spark's reader opens files through Hadoop, which is how HadoopFileIO opens them as well; a
+    // ResolvingFileIO qualifies when it routes every file of the scan to HadoopFileIO
     FileIO io = fileIO.get();
-    if (!(io instanceof HadoopFileIO)) {
+    if (!(io instanceof HadoopFileIO) && !(io instanceof ResolvingFileIO)) {
       return "the FileIO is " + io.getClass().getName() + ", not HadoopFileIO";
     }
 
@@ -235,7 +237,7 @@ class SparkBatch implements Batch {
       return "Spark's vectorized Parquet reader does not support this projection";
     }
 
-    return unsupportedTask();
+    return unsupportedTask(io);
   }
 
   private String unsupportedColumn() {
@@ -254,7 +256,7 @@ class SparkBatch implements Batch {
     return null;
   }
 
-  private String unsupportedTask() {
+  private String unsupportedTask(FileIO io) {
     for (ScanTaskGroup<?> taskGroup : taskGroups) {
       for (ScanTask task : taskGroup.tasks()) {
         if (!supportsParquetBatchReads(task)) {
@@ -269,10 +271,20 @@ class SparkBatch implements Batch {
         if (fileScanTask.file().keyMetadata() != null) {
           return "file " + fileScanTask.file().location() + " is encrypted";
         }
+
+        if (!usesHadoopFileIO(io, fileScanTask.file().location())) {
+          return "file " + fileScanTask.file().location() + " is not read through HadoopFileIO";
+        }
       }
     }
 
     return null;
+  }
+
+  private static boolean usesHadoopFileIO(FileIO io, String location) {
+    return io instanceof HadoopFileIO
+        || (io instanceof ResolvingFileIO
+            && HadoopFileIO.class.isAssignableFrom(((ResolvingFileIO) io).ioClass(location)));
   }
 
   // conditions for using ORC batch reads:
